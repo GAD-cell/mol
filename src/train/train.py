@@ -11,14 +11,14 @@ from torch.utils.data import DataLoader
 from src.model.x_model import MoLCABackbone
 
 epochs = 50
-batch_size = 16  # Réduit car GPT-2 est plus lourd
+batch_size = 32  # Réduit car GPT-2 est plus lourd
 learning_rate = 5e-5  # Plus faible pour éviter catastrophic forgetting
 weight_decay = 1e-5
 val_freq = 5
 save_freq = 10
 max_length = 128  # Longueur max des séquences
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
+prompt = "Describe the following molecule. "
 
 def train_epoch(model, dataloader, optimizer, tokenizer, device, epoch):
     model.train()
@@ -51,7 +51,7 @@ def train_epoch(model, dataloader, optimizer, tokenizer, device, epoch):
         optimizer.zero_grad()
 
         # Forward pass : calcule automatiquement la cross-entropy loss
-        loss = model(batch_graph, batch_text, return_loss=True)
+        loss = model(batch_graph, prompt, labels=batch_text, return_loss=True)
         
         loss.backward()
         
@@ -107,13 +107,9 @@ def validate_epoch(model, dataloader, val_data_list, evaluator, tokenizer, devic
                 )
                 batch_text = {k: v.to(device) for k, v in batch_text.items()}
             
-            # Calcul de la loss
-            loss = model(batch_graph, batch_text, return_loss=True)
+            loss = model(batch_graph, prompt, labels=batch_text, return_loss=True)
             total_loss += loss.item() * batch_size
             
-            # Génération de prédictions pour évaluation
-            # Utiliser un prompt simple
-            prompt = "Description: "
             generated_texts = model.generate(batch_graph, prompt, max_length=80)
             
             all_predictions.extend(generated_texts)
@@ -127,7 +123,6 @@ def validate_epoch(model, dataloader, val_data_list, evaluator, tokenizer, devic
     
     avg_loss = total_loss / num_samples_processed
     
-    # Évaluation avec les métriques
     eval_results = evaluator.evaluate_batch(all_predictions, all_references)
     
     return avg_loss, eval_results
@@ -152,17 +147,14 @@ def main():
 
     print("Loading data and model...")
     
-    # Charger le tokenizer
     tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
     tokenizer.pad_token = tokenizer.eos_token
 
-    # Charger les données
     train_data_list = load_data(train_data_file)
     val_data_list = load_data(val_data_file)
 
-    # Dataset personnalisé qui retourne les graphes et les textes
-    train_dataset = PreprocessedGraphDataset(train_data_file, encode_feat=True)
-    val_dataset = PreprocessedGraphDataset(val_data_file, encode_feat=True)
+    train_dataset = PreprocessedGraphDataset(train_data_file, tokenizer,  encode_feat=True)
+    val_dataset = PreprocessedGraphDataset(val_data_file, tokenizer, encode_feat=True)
     
     train_loader = DataLoader(
         train_dataset, 
@@ -177,18 +169,12 @@ def main():
         collate_fn=collate_fn
     )
 
-    # Initialiser le modèle
     model = MoLCABackbone(model_name="gpt2").to(device)
-    
-    # Optimizer avec différents learning rates
-    # Plus faible pour GPT-2, plus élevé pour la projection
     optimizer = optim.AdamW([
-        {'params': model.llm.parameters(), 'lr': learning_rate * 0.1},  # Fine-tune léger
         {'params': model.graph_projection.parameters(), 'lr': learning_rate},
         {'params': model.gnn_encoder.parameters(), 'lr': learning_rate}
     ], weight_decay=weight_decay)
     
-    # Learning rate scheduler
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     
     evaluator = MolecularCaptionEvaluator(device=device)
@@ -210,7 +196,7 @@ def main():
             "epoch": epoch
         })
         
-        if (epoch + 1) % val_freq == 0:
+        if (epoch ) % val_freq == 0:
             val_loss, eval_results = validate_epoch(
                 model, 
                 val_loader, 
@@ -225,9 +211,6 @@ def main():
             wandb.log({
                 "val/loss": val_loss,
                 "val/composite_score": composite_score,
-                "val/bleu": eval_results.get('bleu', 0),
-                "val/rouge": eval_results.get('rouge', 0),
-                "val/meteor": eval_results.get('meteor', 0),
                 "epoch": epoch
             })
             

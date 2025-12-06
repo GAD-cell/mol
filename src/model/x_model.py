@@ -125,53 +125,66 @@ class MoLCABackbone(nn.Module):
             nn.Dropout(0.1)
         )
     
-    def forward(self, mol_data, batch_text, return_loss=True):
-        """
-        Args:
-            mol_data: données du graphe moléculaire
-            batch_text: dict avec 'input_ids' et 'attention_mask' ou textes bruts
-            return_loss: si True, calcule la loss, sinon génère du texte
-        
-        Returns:
-            loss ou texte généré selon le mode
-        """
+    def forward(self, mol_data, prompt, labels=None, return_loss=True):
         H_mol = self.gnn_encoder(mol_data)
         H_mol, mask = to_dense_batch(H_mol, mol_data.batch)
         batch_size = H_mol.size(0)
- 
         H_mol_projected = self.graph_projection(H_mol)  # [batch, num_nodes, hidden_size]
         
+        if isinstance(prompt, str):
+            prompt = [prompt] * batch_size
+        
+        prompt_inputs = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            padding=True,
+            truncation=True
+        ).to(H_mol.device)
+        
+        prompt_embeds = self.llm.transformer.wte(prompt_inputs['input_ids'])  # [batch, prompt_len, hidden_size]
+        
         if return_loss:
-
-            input_ids = batch_text['input_ids']
-            attention_mask = batch_text['attention_mask']
+            if labels is None:
+                raise ValueError("labels must be provided when return_loss=True")
             
-            text_embeds = self.llm.transformer.wte(input_ids)  # [batch, seq_len, hidden_size]
+            label_ids = labels['input_ids']
+            label_attention_mask = labels['attention_mask']
+            label_embeds = self.llm.transformer.wte(label_ids)  # [batch, label_len, hidden_size]
             
-            combined_embeds = torch.cat([H_mol_projected, text_embeds], dim=1)
+            # Concaténer : [embeddings_graphe | embeddings_prompt | embeddings_labels]
+            combined_embeds = torch.cat([H_mol_projected, prompt_embeds, label_embeds], dim=1)
             
+            # Créer le masque d'attention approprié
             graph_attention_mask = mask.float()
             combined_attention_mask = torch.cat([
-                graph_attention_mask, 
-                attention_mask.float()
+                graph_attention_mask,
+                prompt_inputs['attention_mask'].float(),
+                label_attention_mask.float()
             ], dim=1)
             
+            # Créer les labels : 
+            # - tokens du graphe = -100 (ignorés)
+            # - tokens du prompt = -100 (ignorés)
+            # - tokens des labels = label_ids (à prédire)
             graph_length = H_mol_projected.size(1)
-            labels = torch.cat([
-                torch.full((batch_size, graph_length), -100, device=input_ids.device, dtype=input_ids.dtype),
-                input_ids
+            prompt_length = prompt_embeds.size(1)
+            labels_full = torch.cat([
+                torch.full((batch_size, graph_length), -100, device=label_ids.device, dtype=label_ids.dtype),
+                torch.full((batch_size, prompt_length), -100, device=label_ids.device, dtype=label_ids.dtype),
+                label_ids
             ], dim=1)
             
             outputs = self.llm(
                 inputs_embeds=combined_embeds,
                 attention_mask=combined_attention_mask,
-                labels=labels
+                labels=labels_full
             )
             
             return outputs.loss
         
         else:
-
+            # Mode génération
+            # batch_text est un prompt (str ou list de str)
             if isinstance(batch_text, str):
                 batch_text = [batch_text] * batch_size
             
@@ -208,23 +221,13 @@ class MoLCABackbone(nn.Module):
                 eos_token_id=self.tokenizer.eos_token_id
             )
             
+            # Décoder les tokens générés
+            # Enlever la partie correspondant aux embeddings du graphe et du prompt
             prompt_length = combined_embeds.size(1)
             generated_tokens = outputs[:, prompt_length:]
             generated_text = self.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
             
             return generated_text
     
-    def generate(self, mol_data, prompt="Description: ", max_length=50, temperature=0.7):
-        """
-        Méthode utilitaire pour générer du texte
-        
-        Args:
-            mol_data: données du graphe moléculaire
-            prompt: prompt textuel
-            max_length: nombre de tokens à générer
-            temperature: température de génération
-        
-        Returns:
-            generated_text: liste de textes générés
-        """
+    def generate(self, mol_data, prompt="Describe the following molecule: ", max_length=50, temperature=0.7):
         return self.forward(mol_data, prompt, return_loss=False)
