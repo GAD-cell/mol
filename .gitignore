@@ -1,0 +1,10 @@
+/data_baseline/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+/data/
+*.pkl
+*.csv
+wandb/
+saved_model/
