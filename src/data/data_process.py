@@ -166,13 +166,13 @@ class PreprocessedGraphDataset(Dataset):
         encode_feat: whether to encode the features or not (OHE)
     """
     def __init__(self, graph_path: str, 
-                 tokenizer=None,
+                 emb_dict: Dict[str, torch.Tensor] = None,
                  encode_feat: bool = True):
         print(f"Loading graphs from: {graph_path}")
         with open(graph_path, 'rb') as f:
             self.graphs = pickle.load(f)
+        self.emb_dict = emb_dict
         self.ids = [g.id for g in self.graphs]
-        self.tokenizer = tokenizer
         self.encode_feat = encode_feat
         print(f"Loaded {len(self.graphs)} graphs")
 
@@ -184,16 +184,12 @@ class PreprocessedGraphDataset(Dataset):
         if self.encode_feat : 
             graph = ohe_node_features(graph)
             graph = ohe_edge_features(graph)
-        if self.tokenizer is not None:
-            token = self.tokenizer(
-                graph.description,
-                return_tensors="pt",
-                padding=True,
-                truncation=True
-            )
-            return graph, token
-
-        return graph, graph.description
+        if self.emb_dict is not None:
+            id_ = graph.id
+            text_emb = self.emb_dict[id_]
+            return graph, text_emb
+        else:
+            return graph, graph.smiles, graph.description
 
 
 def collate_fn(batch):
@@ -207,9 +203,8 @@ def collate_fn(batch):
         Batched graph or (batched_graph, stacked_text_embeddings)
     """
     if isinstance(batch[0], tuple):
-        graphs, descriptions = zip(*batch)
+        graphs, smiles,descriptions = zip(*batch)
         batch_graph = Batch.from_data_list(list(graphs))
-        batch_description = descriptions
-        return batch_graph, batch_description
+        return batch_graph, smiles, descriptions
     else:
         return Batch.from_data_list(batch)
