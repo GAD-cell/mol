@@ -162,10 +162,6 @@ class MoLCABackbone(nn.Module):
                 label_attention_mask.float()
             ], dim=1)
             
-            # Créer les labels : 
-            # - tokens du graphe = -100 (ignorés)
-            # - tokens du prompt = -100 (ignorés)
-            # - tokens des labels = label_ids (à prédire)
             graph_length = H_mol_projected.size(1)
             prompt_length = prompt_embeds.size(1)
             labels_full = torch.cat([
@@ -185,20 +181,17 @@ class MoLCABackbone(nn.Module):
         else:
             # Mode génération
             # batch_text est un prompt (str ou list de str)
-            if isinstance(batch_text, str):
-                batch_text = [batch_text] * batch_size
+            if isinstance(prompt, str):
+                prompt = [prompt] * batch_size
             
             inputs = self.tokenizer(
-                batch_text, 
+                prompt, 
                 return_tensors="pt", 
                 padding=True, 
                 truncation=True
             ).to(H_mol.device)
             
-            # Obtenir les embeddings du prompt
             prompt_embeds = self.llm.transformer.wte(inputs['input_ids'])
-            
-            # Concaténer
             combined_embeds = torch.cat([H_mol_projected, prompt_embeds], dim=1)
             
             # Créer le masque d'attention
