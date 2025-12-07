@@ -30,7 +30,7 @@ data_process:
 
 test_model:
 	@echo "Testing model..."
-	@$(PYTHON_EXEC) src/test_model.py
+	@PYTHONPATH=. $(PYTHON_EXEC) src/test_model.py
 	@echo "Model testing complete."
 
 train:
@@ -41,4 +41,9 @@ train:
 infer:
 	@echo "Running inference..."
 	@PYTHONPATH=. $(PYTHON_EXEC) src/inference/inference.py
+	@echo "Inference complete."
+
+add_smiles:
+	@echo "Running inference..."
+	@PYTHONPATH=. $(PYTHON_EXEC) src/add_smiles.py
 	@echo "Inference complete."

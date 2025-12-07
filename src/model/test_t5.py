@@ -78,6 +78,7 @@ class GraphT5_GINEncoder(nn.Module):
         self.output_dim = output_dim
         self.max_length = max_length
         
+        self.dropout = nn.Dropout(p=0.2)
         self.node_embedding = nn.Sequential(
             nn.Linear(node_feat_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim)
@@ -113,6 +114,7 @@ class GraphT5_GINEncoder(nn.Module):
             z = gin_layer(z, edge_index, edge_attr)
             z = bn(z)
             z = F.relu(z)
+            z = self.dropout(z)
         
         from torch_geometric.utils import to_dense_batch
         z_dense, mask = to_dense_batch(z, batch)  # [B, N, hidden_dim]
@@ -144,6 +146,103 @@ class GraphT5_GINEncoder(nn.Module):
         return z_dense, mask
 
 from transformers import T5ForConditionalGeneration, AutoTokenizer
+
+
+
+class QFormer(nn.Module):
+    def __init__(self, hidden_size=768, num_queries=32, num_heads=8, num_layers=2):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_queries = num_queries
+        
+        # ✅ Learnable queries (32 tokens)
+        self.queries = nn.Parameter(torch.randn(1, num_queries, hidden_size))
+        
+        # Multi-layer transformer avec cross-attention
+        self.layers = nn.ModuleList([
+            QFormerLayer(hidden_size, num_heads)
+            for _ in range(num_layers)
+        ])
+        
+    def forward(self, encoder_hidden_states, encoder_attention_mask=None):
+        """
+        Args:
+            encoder_hidden_states: [B, seq_len, hidden_size] - features du graphe/image
+            encoder_attention_mask: [B, seq_len] - masque optionnel
+        
+        Returns:
+            queries: [B, num_queries, hidden_size] - représentation compressée
+        """
+        batch_size = encoder_hidden_states.size(0)
+        
+        # Répéter les queries pour chaque élément du batch
+        queries = self.queries.expand(batch_size, -1, -1)  # [B, 32, hidden_size]
+        
+        # Passer à travers les layers
+        for layer in self.layers:
+            queries = layer(queries, encoder_hidden_states, encoder_attention_mask)
+        
+        return queries
+
+
+class QFormerLayer(nn.Module):
+    """Une couche de Q-Former : Self-Attention + Cross-Attention + FFN"""
+    def __init__(self, hidden_size, num_heads):
+        super().__init__()
+        
+        # Self-attention sur les queries
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=num_heads,
+            dropout=0.1,
+            batch_first=True
+        )
+        self.self_attn_norm = nn.LayerNorm(hidden_size)
+        
+        # Cross-attention : queries attend to encoder outputs
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=num_heads,
+            dropout=0.1,
+            batch_first=True
+        )
+        self.cross_attn_norm = nn.LayerNorm(hidden_size)
+        
+        # Feed-forward
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size * 4, hidden_size),
+            nn.Dropout(0.1)
+        )
+        self.ffn_norm = nn.LayerNorm(hidden_size)
+        
+    def forward(self, queries, encoder_hidden_states, encoder_attention_mask=None):
+        """
+        Args:
+            queries: [B, num_queries, hidden_size]
+            encoder_hidden_states: [B, seq_len, hidden_size]
+            encoder_attention_mask: [B, seq_len]
+        """
+        # 1. Self-attention entre les queries
+        attn_output, _ = self.self_attn(queries, queries, queries)
+        queries = self.self_attn_norm(queries + attn_output)
+        
+        # 2. Cross-attention : queries (Q) attend to encoder (K, V)
+        attn_output, _ = self.cross_attn(
+            query=queries,
+            key=encoder_hidden_states,
+            value=encoder_hidden_states,
+            key_padding_mask=~encoder_attention_mask.bool() if encoder_attention_mask is not None else None
+        )
+        queries = self.cross_attn_norm(queries + attn_output)
+        
+        # 3. Feed-forward
+        ffn_output = self.ffn(queries)
+        queries = self.ffn_norm(queries + ffn_output)
+        
+        return queries
 
 class MoLCABackbone_T5(nn.Module):
     def __init__(self, model_name="GT4SD/multitask-text-and-chemistry-t5-base-standard", 
@@ -182,6 +281,21 @@ class MoLCABackbone_T5(nn.Module):
             nn.Dropout(0.1)
         )
         
+        self.q_former = QFormer(
+            hidden_size=768,    # Dimension de T5
+            num_queries=32,     # 32 tokens de sortie
+            num_heads=8,
+            num_layers=2        # Nombre de couches de transformer
+        )
+        
+
+        self.query = nn.Parameter(torch.randn(1, 32, self.hidden_size))
+        self.q_former = nn.MultiheadAttention(
+            embed_dim=self.hidden_size,
+            num_heads=8,
+            dropout=0.1,
+            batch_first=True)
+
         if freeze_encoder:
             for param in self.t5_model.encoder.parameters():
                 param.requires_grad = False
@@ -192,13 +306,14 @@ class MoLCABackbone_T5(nn.Module):
                 param.requires_grad = False
             print("T5 Decoder frozen")
     
-    def forward(self, mol_data, smiles_text, prompt="Describe the following molecule:", labels=None, return_loss=True):
+    def forward(self, mol_data, smiles_text, prompt="Caption the following molecule:", labels=None, return_loss=True):
 
         batch_size = mol_data.batch.max().item() + 1
         
         H_graph, graph_mask = self.gnn_encoder(mol_data)  # [B, max_nodes, hidden_size]
         H_graph = self.graph_projection(H_graph)
-        
+        H_graph = self.q_former(H_graph, graph_mask) # [B, 32, hidden_size]
+
         if isinstance(smiles_text, str):
             smiles_text = [smiles_text] * batch_size
         
@@ -264,6 +379,8 @@ class MoLCABackbone_T5(nn.Module):
 
             decoder_input_ids = prompt_inputs['input_ids'].to(combined_encoder_hidden.device)
             decoder_attention_mask = prompt_inputs['attention_mask'].to(combined_encoder_hidden.device)
+            decoder_input_ids = decoder_input_ids.repeat(batch_size, 1)
+            decoder_attention_mask = decoder_attention_mask.repeat(batch_size, 1)
 
             generated_ids = self.t5_model.generate(
                 encoder_outputs=BaseModelOutput(
@@ -272,7 +389,7 @@ class MoLCABackbone_T5(nn.Module):
                 attention_mask=combined_attention_mask,
                 decoder_input_ids=decoder_input_ids,
                 decoder_attention_mask=decoder_attention_mask,
-                max_length=150,
+                max_length=512,
                 num_beams=5,
                 early_stopping=True,
                 no_repeat_ngram_size=2

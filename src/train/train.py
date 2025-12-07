@@ -10,11 +10,11 @@ from torch.utils.data import DataLoader
 from src.model.test_t5 import MoLCABackbone_T5
 
 
-epochs = 50
-batch_size = 16 
+epochs = 20
+batch_size = 64 
 learning_rate = 5e-5  
 weight_decay = 1e-5
-val_freq = 5
+val_freq = 3
 save_freq = 10
 max_length = 128  
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -148,8 +148,15 @@ def main():
         shuffle=True, 
         collate_fn=collate_fn
     )
+
+    from torch.utils.data import Subset
+    SUBSET_SIZE = 250
+    indices = list(range(SUBSET_SIZE))
+
+    val_dataset_subset = Subset(val_dataset, indices)
+
     val_loader = DataLoader(
-        val_dataset, 
+        val_dataset_subset, 
         batch_size=batch_size, 
         shuffle=False, 
         collate_fn=collate_fn
@@ -169,14 +176,22 @@ def main():
         {'params': model.graph_projection.parameters(), 'lr': learning_rate},
     ], weight_decay=weight_decay)
     
-    # Learning rate scheduler
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    from transformers import get_linear_schedule_with_warmup
+    total_steps = len(train_loader) * epochs
+    num_warmup_steps = int(0.1 * total_steps) 
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, 
+        num_warmup_steps=num_warmup_steps, 
+        num_training_steps=total_steps
+    )
     
     evaluator = MolecularCaptionEvaluator(device=device)
 
     wandb.watch(model, log="all", log_freq=100)
 
     best_score = 0.0
+
+
     
     print(f"Starting training on {device}...")
     
@@ -191,7 +206,7 @@ def main():
             "epoch": epoch
         })
         
-        if (epoch + 1) % val_freq == 0:
+        if (epoch) % val_freq == 0:
             val_loss, eval_results = validate_epoch(
                 model, 
                 val_loader, 
@@ -206,9 +221,7 @@ def main():
             wandb.log({
                 "val/loss": val_loss,
                 "val/composite_score": composite_score,
-                "val/bleu": eval_results.get('bleu', 0),
-                "val/rouge": eval_results.get('rouge', 0),
-                "val/meteor": eval_results.get('meteor', 0),
+                "val/bleu": eval_results.get('bleu4_f1_mean', 0),
                 "epoch": epoch
             })
             
